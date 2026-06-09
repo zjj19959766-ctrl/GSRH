@@ -1,141 +1,155 @@
 ﻿# GSRH: Geometric-Semantic Regulated Hypergraph for Tiny Object Detection
 
-Official implementation of **GSRH** on top of **Ultralytics YOLO (YOLOv11-style codebase)**.
+Official implementation of **Geometric-Semantic Regulated Hypergraph (GSRH)** for tiny object detection in remote sensing imagery.
+
+GSRH introduces a geometry-semantic regulated hypergraph framework to model polyadic higher-order correlations among tiny objects, addressing dense layouts, low signal-to-noise ratio, contextual clutter, and feature ambiguity.
 
 ## Overview
-GSRH targets tiny object detection in remote sensing scenes with dense layout, cluttered background, and directional ambiguity.
 
-This repository keeps the Ultralytics training/inference pipeline, and introduces two core ideas:
-- **GPS (Geometric Prior Synthesis)**: geometry-aware directional prior enhancement.
-- **SRC (Semantic Reliability Controller)**: reliability-gated semantic propagation.
+Tiny object detection in remote sensing is challenging because tiny instances are easily overwhelmed by background regions and pairwise relations are often insufficient in dense scenes. GSRH addresses this issue by constructing and regulating hypergraphs with two task-aware modules:
 
-## Key Innovations
-### 1) GPS: Geometric Prior Synthesis
-- Location: `ultralytics/nn/modules/block.py`
-- Related classes: `DirectionalShift`, `SingleAnglePrior`, `GPS`
-- Purpose: inject directional priors (default 0 deg and 90 deg) into feature enhancement.
+* **GPS (Geometric Prior Synthesis)**: guides geometry-aware vertex selection and hyperedge construction.
+* **SRC (Semantic Reliability Controller)**: regulates hypergraph message passing with semantic reliability estimation.
 
-### 2) SRC: Semantic Reliability Controller
-- Location: `ultralytics/nn/modules/block.py`
-- Related class: `SRC`
-- Purpose: estimate reliability from self/neighbor statistics and adaptively gate features.
+The overall pipeline is:
 
-### 3) Architecture-Level Integration
-- Location: `ultralytics/cfg/models/12/yolo12*.yaml`
-- Core change: use `A2C2f` blocks in backbone/neck for stronger area-aware representation.
-
-## Repository Structure
 ```text
-.
-├─ ultralytics/
-│  ├─ nn/modules/block.py                # GPS/SRC and related modules
-│  └─ cfg/models/12/yolo12*.yaml         # GSRH-oriented model configs
-├─ docs/
-├─ examples/
-├─ tests/
-└─ README.md
+Backbone Feature → GPS → Geometry-aware Hypergraph Construction → SRC → Regulated High-order Representation → Detection Head
 ```
 
-## Environment
-Recommended:
-- Python 3.10
-- PyTorch >= 2.0 (CUDA matched with your machine)
-- OS: Linux/Windows
+## Key Components
 
-Create env:
+### 1. GPS: Geometric Prior Synthesis
+
+GPS generates an axis-aligned geometric prior from horizontal and vertical directional responses. The prior modulates vertex features and guides Top-K vertex selection, reducing background-dominated candidates during hypergraph construction.
+
+Main functions:
+
+* axis-aligned directional aggregation;
+* geometry-aware feature modulation;
+* Top-K vertex selection;
+* improved hyperedge purity under cluttered tiny-object scenes.
+* 
+### 2. SRC: Semantic Reliability Controller
+
+SRC estimates hyperedge reliability from self-region and neighbor-context statistics. It softly gates hyperedge-to-vertex propagation to suppress unreliable background-dominated message passing while preserving useful sparse-object cues.
+
+Main functions:
+
+* vertex-to-hyperedge aggregation;
+* self-region reliability estimation;
+* neighbor-context reliability estimation;
+* reliability-gated hyperedge-to-vertex propagation.
+
+## Environment
+
+Recommended environment:
+
+```text
+Python >= 3.8
+PyTorch >= 2.0
+CUDA-compatible GPU
+Linux / Windows
+```
+
+Create environment:
+
 ```bash
 conda create -n gsrh python=3.10 -y
 conda activate gsrh
 ```
 
-Install PyTorch (example for CUDA 12.1):
+Install PyTorch, for example with CUDA 12.1:
+
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
 Install dependencies:
+
 ```bash
 pip install ultralytics opencv-python pyyaml scipy tqdm matplotlib psutil pillow thop
 ```
 
 ## Data Preparation
-Use Ultralytics dataset YAML format:
 
-```yaml
-# data.yaml
-path: /path/to/dataset
-train: images/train
-val: images/val
-test: images/test
-names:
-  0: class0
-  1: class1
-```
+The paper evaluates GSRH on:
+
+- [VEDAI](https://downloads.greyc.fr/vedai/)
+- [USOD](https://github.com/yemu1138178251/FFCA-YOLO)
+- [AI-TOD](https://github.com/jwwangchn/AI-TOD)
 
 ## Training
-Main GSRH line (detect):
+
+Example training command:
+
 ```bash
 yolo task=detect mode=train \
-  model=ultralytics/cfg/models/12/yolo12.yaml \
+  model=/path/to/gsrh.yaml \
   data=/path/to/data.yaml \
-  epochs=300 imgsz=640 batch=16 device=0 workers=8
+  epochs=300 \
+  imgsz=800 \
+  batch=16 \
+  device=0 \
+  workers=8
 ```
-
-Resume training:
-```bash
-yolo task=detect mode=train resume model=runs/detect/train/weights/last.pt
-```
-
 ## Evaluation
+
 ```bash
 yolo task=detect mode=val \
   model=runs/detect/train/weights/best.pt \
   data=/path/to/data.yaml \
-  imgsz=640 batch=16 device=0
+  imgsz=800 \
+  batch=32 \
+  device=0
 ```
 
 ## Inference
-Images/folder:
+
+Images or folders:
+
 ```bash
 yolo task=detect mode=predict \
   model=runs/detect/train/weights/best.pt \
   source=/path/to/images \
-  imgsz=640 conf=0.25 device=0
+  imgsz=800 \
+  conf=0.25 \
+  device=0
 ```
 
-Video:
-```bash
-yolo task=detect mode=predict \
-  model=runs/detect/train/weights/best.pt \
-  source=/path/to/video.mp4 \
-  imgsz=640 conf=0.25 device=0
+## Experimental Settings
+
+For fair comparison, the main experiments use:
+
+```text
+Input size: 800 × 800
+Epochs: 300
+Batch size: 16 for training
+Batch size: 32 for validation/testing
+Optimizer: SGD
+Momentum: 0.937
+Weight decay: 0.0005
+Initial learning rate: 0.01
+Final learning rate: 0.0001
+Workers: 8
+AMP: enabled
+Multi-scale training: disabled
 ```
-
-## Outputs
-- Training runs: `runs/detect/train*`
-- Best weights: `runs/detect/train*/weights/best.pt`
-- Inference results: `runs/detect/predict*`
-
-## Notes
-- `MANet` in `block.py` is experimental; reproduction is recommended with `yolo12*.yaml` main configs.
-- For stable reproduction, fix random seed, data split, and report mAP50/mAP50-95/FPS together.
 
 ## Citation
-If this project helps your research, please cite:
+
+If this project is helpful to your research, please cite:
 
 ```bibtex
-@article{zheng2025gsrh,
+@article{zheng2026gsrh,
   title={Geometric-Semantic Regulated Hypergraph for Tiny Object Detection},
   author={Zheng, JinJie and Zhuang, Jingyi and Sa, Baihui and Xiang, Wenjie and Zhang, Zetao and Zhu, Jianqing},
-  journal={IEEE Transactions on Geoscience and Remote Sensing},
-  year={2025}
+  journal={arXiv preprint arXiv:2110.13389},
+  year={2026}
 }
 ```
 
-## License
-This project is built on the Ultralytics codebase. Please follow:
-- This repository's license file
-- Upstream Ultralytics license and usage terms
-
 ## Acknowledgements
-We thank the Ultralytics team and the remote sensing tiny-object detection community for open-source contributions.
+
+This project is built upon the Ultralytics codebase. We thank the Ultralytics team and the remote sensing tiny-object detection community for their open-source contributions.
+
