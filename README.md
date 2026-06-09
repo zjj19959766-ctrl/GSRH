@@ -6,10 +6,14 @@ GSRH introduces a geometry-semantic regulated hypergraph framework to model poly
 
 ## Overview
 
-Tiny object detection in remote sensing is challenging because tiny instances are easily overwhelmed by background regions and pairwise relations are often insufficient in dense scenes. GSRH addresses this issue by constructing and regulating hypergraphs with two task-aware modules:
+Tiny object detection in remote sensing is challenging because tiny instances are easily overwhelmed by background regions and pairwise relations are insufficient in dense scenes. As shown in the pipeline figure below, GSRH addresses this issue by inserting a geometry-semantic regulated hypergraph module between the backbone and detection head.
 
-* **GPS (Geometric Prior Synthesis)**: guides geometry-aware vertex selection and hyperedge construction.
-* **SRC (Semantic Reliability Controller)**: regulates hypergraph message passing with semantic reliability estimation.
+![GSRH framework](Fig/fig.frame.png)
+
+GSRH contains two task-aware components:
+
+- **GPS (Geometric Prior Synthesis)**: generates geometry-aware vertices and hyperedges through axis-aligned prior modulation and Top-K selection.
+- **SRC (Semantic Reliability Controller)**: estimates hyperedge reliability and regulates high-order message passing.
 
 The overall pipeline is:
 
