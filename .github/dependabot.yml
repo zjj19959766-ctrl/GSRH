@@ -22,5 +22,3 @@ updates:
     open-pull-requests-limit: 5
     reviewers:
       - glenn-jocher
-    labels:
-      - dependencies
