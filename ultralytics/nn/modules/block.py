@@ -1797,81 +1797,79 @@ class ABlock(nn.Module):
 
 
 class SRC(nn.Module):
-    """Semantic Reliability Controller with explicit mean/variance/degree statistics."""
+    """Regulate selected-vertex messages using channel-wise semantic gates."""
 
-    def __init__(self, eps=1e-6, alpha=0.75, gmin=0.1, tau=1.0):
+    def __init__(self, channels, eps=1e-6, alpha=0.75, lambda_=0.1, gamma=0.1, tau=1.0):
         super().__init__()
+        if not (0 <= alpha <= 1 and 0 <= lambda_ < 1 and 0 <= gamma < 1):
+            raise ValueError("SRC requires alpha in [0, 1] and lambda_ and gamma in [0, 1).")
+        if not (tau > 0 and eps > 0):
+            raise ValueError("SRC requires positive tau and eps.")
         self.eps = eps
         self.alpha = alpha
-        self.gmin = gmin
+        self.lambda_ = lambda_
+        self.gamma = gamma
         self.tau = tau
-        self.fc_s = nn.Linear(3, 1, bias=True)
-        self.fc_n = nn.Linear(3, 1, bias=True)
+        self.vertex_proj = nn.Linear(channels, channels, bias=False)
 
-    def _self_stats(self, vertices, incidence):
-        degree = incidence.sum(dim=1).clamp_min(1.0)
-        h = torch.bmm(incidence.transpose(1, 2), vertices) / degree.unsqueeze(-1)
-        diff = vertices.unsqueeze(2) - h.unsqueeze(1)
-        var = (incidence.unsqueeze(-1) * diff.square()).sum(dim=1) / degree.unsqueeze(-1)
-        degree_norm = degree / degree.max(dim=1, keepdim=True).values.clamp_min(1.0)
-        stats = {
-            "mean": h.mean(dim=-1),
-            "variance": var.mean(dim=-1),
-            "degree": degree_norm,
-        }
-        return h, stats
+    def _neighbor_context(self, hyperedges):
+        count = hyperedges.shape[1]
+        if count == 1:
+            return torch.zeros_like(hyperedges)
 
-    def _neighbor_stats(self, hyperedges, degree):
-        if hyperedges.shape[1] <= 1:
-            zeros = torch.zeros_like(degree)
-            return {"mean": zeros, "variance": zeros, "degree": degree}
-
-        z = F.normalize(hyperedges, dim=-1)
-        sim = torch.bmm(z, z.transpose(1, 2)) / self.tau
-        mask = torch.eye(hyperedges.shape[1], device=hyperedges.device, dtype=torch.bool).unsqueeze(0)
-        sim = sim.masked_fill(mask, float("-inf"))
-        weight = F.softmax(sim, dim=-1)
-        h_ctx = torch.bmm(weight, hyperedges)
-        h_ctx2 = torch.bmm(weight, hyperedges.square())
-        var_ctx = (h_ctx2 - h_ctx.square()).clamp_min(0.0)
-        degree_ctx = torch.bmm(weight, degree.unsqueeze(-1)).squeeze(-1)
-        return {
-            "mean": h_ctx.mean(dim=-1),
-            "variance": var_ctx.mean(dim=-1),
-            "degree": degree_ctx,
-        }
-
-    def _gate_from_stats(self, stats, linear):
-        x = torch.stack([stats["mean"], stats["variance"], stats["degree"]], dim=-1)
-        gate = torch.sigmoid(linear(x)).squeeze(-1)
-        return gate * (1.0 - self.gmin) + self.gmin
+        normalized = F.normalize(hyperedges, dim=-1, eps=self.eps)
+        similarity = torch.bmm(normalized, normalized.transpose(1, 2))
+        diagonal = torch.eye(count, dtype=torch.bool, device=hyperedges.device)
+        weights = similarity.masked_fill(diagonal, float("-inf")).softmax(dim=-1)
+        return torch.bmm(weights, hyperedges)
 
     def forward(self, vertices, incidence):
-        hyperedges, self_stats = self._self_stats(vertices, incidence)
-        neighbor_stats = self._neighbor_stats(hyperedges, self_stats["degree"])
-        g_s = self._gate_from_stats(self_stats, self.fc_s)
-        g_n = self._gate_from_stats(neighbor_stats, self.fc_n)
-        gate = self.alpha * g_s + (1.0 - self.alpha) * g_n
-        h_tilde = hyperedges * gate.unsqueeze(-1)
-        vertex_degree = incidence.sum(dim=2).clamp_min(1.0)
-        v_out = torch.bmm(incidence, h_tilde) / vertex_degree.unsqueeze(-1)
-        return v_out, h_tilde, {"self_stats": self_stats, "neighbor_stats": neighbor_stats, "gate": gate}
+        # V2H: project each selected vertex, then average the members of each hyperedge.
+        projected = self.vertex_proj(vertices)
+        membership = incidence.to(projected.dtype)
+        edge_degree = membership.sum(dim=1).unsqueeze(-1)
+        hyperedges = torch.bmm(membership.transpose(1, 2), projected) / edge_degree
+
+        # Compute the self-region statistics over the selected vertices before projection.
+        stats = vertices.float() if vertices.dtype in (torch.float16, torch.bfloat16) else vertices
+        variance, mean = torch.var_mean(stats, dim=1, unbiased=False, keepdim=True)
+        self_gate = self.lambda_ + (1.0 - self.lambda_) * torch.exp(
+            -(variance + self.eps).sqrt() / self.tau
+        )
+
+        context_features = hyperedges.to(stats.dtype)
+        neighbors = self._neighbor_context(context_features).to(stats.dtype)
+        agreement = F.cosine_similarity(context_features, neighbors, dim=-1, eps=self.eps).unsqueeze(-1)
+        zeta = (agreement.sigmoid() * neighbors).sum(dim=1, keepdim=True)
+        neighbor_gate = self.gamma + (1.0 - self.gamma) * zeta.tanh()
+        gate = self.alpha * self_gate + (1.0 - self.alpha) * neighbor_gate
+
+        regulated = hyperedges * gate.to(hyperedges.dtype)
+        vertex_degree = membership.sum(dim=2, keepdim=True)
+        messages = torch.bmm(membership, regulated) / vertex_degree
+        return messages, regulated, {
+            "mean": mean,
+            "variance": variance,
+            "H_star": neighbors,
+            "self_gate": self_gate,
+            "neighbor_gate": neighbor_gate,
+            "gate": gate,
+        }
+
 
 class A2C2f(nn.Module):
     """
-    Area-Attention C2f module for enhanced feature extraction with area-based attention mechanisms.
+    C2f wrapper with GSRH and C3k branches.
 
-    This module extends the C2f architecture by incorporating area-attention and ABlock layers for improved feature
-    processing. It supports both area-attention and standard convolution modes.
 
     Attributes:
         cv1 (Conv): Initial 1x1 convolution layer that reduces input channels to hidden channels.
         cv2 (Conv): Final 1x1 convolution layer that processes concatenated features.
-        gamma (nn.Parameter | None): Learnable parameter for residual scaling when using area attention.
-        m (nn.ModuleList): List of either ABlock or C3k modules for feature processing.
+        gamma (nn.Parameter | None): Learnable parameter for residual scaling when using GSRH.
+        m (nn.ModuleList): List of either GSRH blocks or C3k modules for feature processing.
 
     Methods:
-        forward: Processes input through area-attention or standard convolution pathway.
+        forward: Processes input through GSRH or standard convolution pathway.
 
     Examples:
         >>> m = A2C2f(512, 512, n=1, a2=True, area=1)
@@ -1883,30 +1881,30 @@ class A2C2f(nn.Module):
 
     def __init__(self, c1, c2, n=1, a2=True, area=1, residual=False, mlp_ratio=2.0, e=0.5, g=1, shortcut=True):
         """
-        Initialize Area-Attention C2f module.
+        Initialize the C2f wrapper.
 
         Args:
             c1 (int): Number of input channels.
             c2 (int): Number of output channels.
-            n (int): Number of ABlock or C3k modules to stack.
-            a2 (bool): Whether to use area attention blocks. If False, uses C3k blocks instead.
-            area (int): Number of areas the feature map is divided.
+            n (int): Number of GSRH or C3k groups to stack.
+            a2 (bool): Whether to use GSRH blocks. If False, uses C3k blocks.
+            area (int): Retained for compatibility with existing model configurations.
             residual (bool): Whether to use residual connections with learnable gamma parameter.
-            mlp_ratio (float): Expansion ratio for MLP hidden dimension.
+            mlp_ratio (float): Retained for compatibility with existing model configurations.
             e (float): Channel expansion ratio for hidden channels.
             g (int): Number of groups for grouped convolutions.
             shortcut (bool): Whether to use shortcut connections in C3k blocks.
         """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
+        assert c_ % 32 == 0, "Hidden channels must be a multiple of 32."
 
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv((1 + n) * c_, c2, 1)
 
         self.gamma = nn.Parameter(0.01 * torch.ones(c2), requires_grad=True) if a2 and residual else None
         self.m = nn.ModuleList(
-            nn.Sequential(*(GSRHBlock(c_, area=area) for _ in range(2))) if a2 else C3k(c_, c_, 2, shortcut, g)
+            nn.Sequential(*(GSRHBlock(c_) for _ in range(2))) if a2 else C3k(c_, c_, 2, shortcut, g)
             for _ in range(n)
         )
 
@@ -1939,181 +1937,119 @@ class MANet(nn.Module):
         g=1,
         e=0.5,
         steps=4,
-        use_edge=True,
+        *,
+        topk=8,
+        rho=1.0,
         alpha=0.75,
-        gmin=0.1,
-        theta_rad=None,
+        lambda_=0.1,
+        gamma=0.1,
+        tau=1.0,
+        eps=1e-6,
     ):
         super().__init__()
-
-        self.c = int(c2 * e)
         self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
-        self.gsrh = GSRHBlock(c2, steps=steps, use_edge=use_edge, alpha=alpha, gmin=gmin)
+        self.gsrh = GSRHBlock(
+            c2, steps=steps, topk=topk, rho=rho, alpha=alpha, lambda_=lambda_, gamma=gamma, tau=tau, eps=eps
+        )
 
     def forward(self, x):
         return self.gsrh(self.proj(x))
 
 
 class DirectionalShift(nn.Module):
-    def __init__(self, steps=4, padding_mode="border"):
-        super().__init__()
-        self.S = steps
-        self.padding_mode = padding_mode
+    """Sample symmetric offsets using border replication."""
 
-    @torch.no_grad()
-    def _base_grid(self, B, H, W, device):
-        ys = torch.linspace(-1, 1, H, device=device)
-        xs = torch.linspace(-1, 1, W, device=device)
-        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-        base = torch.stack([gx, gy], dim=-1)
-        return base.unsqueeze(0).repeat(B, 1, 1, 1)
+    def __init__(self, steps=4):
+        super().__init__()
+        self.steps = steps
 
     def forward(self, x, theta_rad):
-        B, C, H, W = x.shape
-        device = x.device
-        base = self._base_grid(B, H, W, device)
-        if not torch.is_tensor(theta_rad):
-            theta_rad = x.new_tensor(theta_rad)
-        cos_t = torch.cos(theta_rad)
-        sin_t = torch.sin(theta_rad)
-        dx = (2.0 / max(W - 1, 1)) * cos_t
-        dy = (2.0 / max(H - 1, 1)) * sin_t
+        _, _, height, width = x.shape
+        offsets = range(-self.steps, self.steps + 1)
+        if theta_rad == 0.0:
+            positions = torch.arange(width, device=x.device)
+            return torch.cat([x.index_select(3, (positions + s).clamp(0, width - 1)) for s in offsets], dim=1)
+        if theta_rad == math.pi / 2:
+            positions = torch.arange(height, device=x.device)
+            return torch.cat([x.index_select(2, (positions + s).clamp(0, height - 1)) for s in offsets], dim=1)
 
-        outs = []
-        for s in range(-self.S, self.S + 1):
-            if s == 0:
-                grid = base
-            else:
-                shift = torch.stack((dx * s, dy * s)).to(device=device, dtype=base.dtype).view(1, 1, 1, 2)
-                grid = base + shift
-            y = F.grid_sample(x, grid, mode="bilinear", padding_mode=self.padding_mode, align_corners=True)
-            outs.append(y)
-        return torch.cat(outs, dim=1)
-
-class SingleAnglePrior(nn.Module):  # angle-free perception
-    def __init__(self, C, steps=4, use_edge=True):
-        super().__init__()
-        self.shift = DirectionalShift(steps=steps)
-        self.S = steps
-        self.use_edge = use_edge
-        in_ch = C if use_edge else (2 * steps + 1) * C
-        self.head = nn.Sequential(
-            nn.Conv2d(in_ch, C, 1, 1, bias=False),
-            nn.Sigmoid()
+        # With align_corners=False, pixel centers and displacements also work on singleton axes.
+        y = (torch.arange(height, device=x.device, dtype=x.dtype) + 0.5) * (2.0 / height) - 1.0
+        x_pos = (torch.arange(width, device=x.device, dtype=x.dtype) + 0.5) * (2.0 / width) - 1.0
+        yy, xx = torch.meshgrid(y, x_pos, indexing="ij")
+        base = torch.stack((xx, yy), dim=-1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+        step = x.new_tensor((2.0 * math.cos(theta_rad) / width, 2.0 * math.sin(theta_rad) / height))
+        return torch.cat(
+            [
+                F.grid_sample(x, base + s * step, mode="bilinear", padding_mode="border", align_corners=False)
+                for s in offsets
+            ],
+            dim=1,
         )
 
-    def _edge(self, x, shifted):
-        if self.S == 0:
-            return torch.zeros_like(x)
-        B, C, H, W = x.shape
-        left = shifted[:, : self.S * C]
-        right = shifted[:, (self.S + 1) * C :]
-        neigh = torch.cat([left, right], dim=1).view(B, 2 * self.S, C, H, W).mean(dim=1)
-        return (x - neigh).abs()
+
+class SingleAnglePrior(nn.Module):
+    """Learn a linear combination of the channels at each directional offset."""
+
+    def __init__(self, channels, steps=4):
+        super().__init__()
+        self.shift = DirectionalShift(steps)
+        self.weight_offsets = nn.Conv2d((2 * steps + 1) * channels, channels, 1, bias=False)
 
     def forward(self, x, theta_rad):
-        shifted = self.shift(x, theta_rad)
-        feat = self._edge(x, shifted) if self.use_edge else shifted
-        return self.head(feat)
+        return self.weight_offsets(self.shift(x, theta_rad))
+
 
 class GPS(nn.Module):
-    """Geometric Prior Synthesis with prior modulation and incidence-matrix construction."""
+    """Synthesize a geometric prior and build a graph on selected vertices."""
 
-    def __init__(self, c1, c2=None, n=1, shortcut=False, p=1, kernel_size=3, g=1, e=0.5,
-                 steps=4, use_edge=True, fuse_mode="mul", topk=8, edge_size=8, sigma_divisor=4.0):
+    def __init__(self, channels, steps=4, topk=8, rho=1.0):
         super().__init__()
-        assert fuse_mode in {"mul", "cat"}
-        self.fuse_mode = fuse_mode
+        if steps < 1 or topk < 1 or not (rho > 0 and math.isfinite(rho)):
+            raise ValueError("GPS requires positive steps, topk, and a positive finite rho.")
         self.topk = topk
-        self.edge_size = edge_size
-        self.sigma_divisor = sigma_divisor
-        self.prior = SingleAnglePrior(C=c1, steps=steps, use_edge=use_edge)
-        self.fuse_0_90 = nn.Sequential(
-            nn.Conv2d(2 * c1, c1, 1, 1, bias=False),
-            nn.Sigmoid()
-        )
-        if self.fuse_mode == "cat":
-            self.post_cat = Conv(2 * c1, c1, 1, 1)
+        self.rho = rho
+        self.horizontal = SingleAnglePrior(channels, steps)
+        self.vertical = SingleAnglePrior(channels, steps)
+        self.fuse_0_90 = nn.Conv2d(2 * channels, channels, 1, bias=False)
 
-    def _apply_prior(self, y, P):
-        if self.fuse_mode == "mul":
-            return y * P
-        y = torch.cat([y, y * P], dim=1)
-        return self.post_cat(y)
-
-    def _build_incidence_matrix(self, vertices, h, w):
-        b, n, _ = vertices.shape
-        k = min(self.topk, n)
-        edge_size = min(self.edge_size, n)
-        score = torch.norm(vertices, p=2, dim=-1)
-        topk_idx = torch.topk(score, k=k, dim=1).indices
-
-        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, vertices.shape[-1])
-        anchors = torch.gather(vertices, 1, gather_idx)
-
-        yy, xx = torch.meshgrid(
-            torch.arange(h, device=vertices.device, dtype=vertices.dtype),
-            torch.arange(w, device=vertices.device, dtype=vertices.dtype),
-            indexing="ij",
-        )
-        pos = torch.stack((yy, xx), dim=-1).reshape(1, n, 2).repeat(b, 1, 1)
-        anchor_pos = torch.gather(pos, 1, topk_idx.unsqueeze(-1).expand(-1, -1, 2))
-
-        v_norm = F.normalize(vertices, dim=-1)
-        a_norm = F.normalize(anchors, dim=-1)
-        feat_aff = 0.5 * (1.0 + torch.einsum("bnc,bkc->bnk", v_norm, a_norm))
-        dist2 = (pos.unsqueeze(2) - anchor_pos.unsqueeze(1)).square().sum(dim=-1)
-        sigma = max(min(h, w) / self.sigma_divisor, 1.0)
-        spatial_aff = torch.exp(-dist2 / (2.0 * sigma * sigma))
-        affinity = feat_aff * spatial_aff
-
-        neighbor_idx = torch.topk(affinity, k=edge_size, dim=1).indices
-        a = vertices.new_zeros((b, n, k))
-        a.scatter_(1, neighbor_idx, 1.0)
-        a.scatter_(1, topk_idx.unsqueeze(1), 1.0)
-        a = (a > 0).to(vertices.dtype)
-        return {
-            "A": a,
-            "topk_idx": topk_idx,
-            "anchors": anchors,
-            "affinity": affinity,
-            "vertex_degree": a.sum(dim=2),
-            "hyperedge_degree": a.sum(dim=1),
-        }
-
-    def forward(self, x, theta_rad=None, return_graph=False):
-        y = x
-
-        if theta_rad is None:
-            P0 = self.prior(y, 0.0)
-            P90 = self.prior(y, math.pi / 2)
-            P = self.fuse_0_90(torch.cat([y * P0, y * P90], dim=1))
-            y = self._apply_prior(y, P)
-        else:
-            P = self.prior(y, theta_rad)
-            y = self._apply_prior(y, P)
-
-        vg = y.flatten(2).transpose(1, 2)
-        graph = self._build_incidence_matrix(vg, y.shape[2], y.shape[3])
-        graph["prior"] = P.flatten(2).transpose(1, 2)
-        graph["Vg"] = vg
-        graph["shape"] = y.shape
-        return (y, graph) if return_graph else y
+    def forward(self, x):
+        horizontal = self.horizontal(x, 0.0)
+        vertical = self.vertical(x, math.pi / 2)
+        prior = self.fuse_0_90(torch.cat((horizontal, vertical), dim=1)).sigmoid()
+        modulated = (x * prior).flatten(2).transpose(1, 2)
+        features = modulated.float() if modulated.dtype in (torch.float16, torch.bfloat16) else modulated
+        scores = torch.linalg.vector_norm(features, dim=-1)
+        indices = scores.topk(min(self.topk, scores.shape[1]), dim=1).indices
+        gather_indices = indices.unsqueeze(-1).expand(-1, -1, modulated.shape[-1])
+        selected = modulated.gather(1, gather_indices)
+        graph_features = features.gather(1, gather_indices)
+        distances = torch.cdist(graph_features, graph_features, compute_mode="donot_use_mm_for_euclid_dist")
+        incidence = distances < self.rho
+        return selected, incidence, indices, prior
 
 
 class GSRHBlock(nn.Module):
-    """Minimal GSRH block: GPS builds A, SRC performs gated V2H/H2V messaging."""
+    """Run GPS and SRC and write propagated features to their original locations."""
 
-    def __init__(self, channels, area=1, steps=4, use_edge=True, alpha=0.75, gmin=0.1):
+    def __init__(self, channels, steps=4, topk=8, rho=1.0, alpha=0.75, lambda_=0.1, gamma=0.1, tau=1.0, eps=1e-6):
         super().__init__()
-        self.gps = GPS(channels, channels, steps=steps, use_edge=use_edge)
-        self.src = SRC(alpha=alpha, gmin=gmin)
+        self.gps = GPS(channels, steps=steps, topk=topk, rho=rho)
+        self.src = SRC(channels, eps=eps, alpha=alpha, lambda_=lambda_, gamma=gamma, tau=tau)
         self.last_debug = None
 
     def forward(self, x):
-        y, graph = self.gps(x, return_graph=True)
-        v_out, h_tilde, aux = self.src(graph["Vg"], graph["A"])
-        b, c, h, w = y.shape
-        y_msg = v_out.transpose(1, 2).reshape(b, c, h, w)
-        self.last_debug = {**graph, **aux, "H_tilde": h_tilde}
-        return y + y_msg
+        selected, incidence, indices, prior = self.gps(x)
+        messages, regulated, stats = self.src(selected, incidence)
+        vertices = x.flatten(2).transpose(1, 2)
+        write_indices = indices.unsqueeze(-1).expand(-1, -1, vertices.shape[-1])
+        output = vertices.scatter(1, write_indices, messages.to(vertices.dtype))
+        self.last_debug = {
+            "M": incidence,
+            "topk_idx": indices,
+            "prior": prior.detach(),
+            "V_selected": selected.detach(),
+            "H_tilde": regulated.detach(),
+            **{name: value.detach() for name, value in stats.items()},
+        }
+        return output.transpose(1, 2).reshape_as(x)
