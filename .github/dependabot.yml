@@ -13,8 +13,6 @@ updates:
     open-pull-requests-limit: 10
     reviewers:
       - glenn-jocher
-    labels:
-      - dependencies
 
   - package-ecosystem: github-actions
     directory: "/.github/workflows"
@@ -24,5 +22,3 @@ updates:
     open-pull-requests-limit: 5
     reviewers:
       - glenn-jocher
-    labels:
-      - dependencies
